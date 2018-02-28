@@ -1,0 +1,144 @@
+---
+title: "Using RcppArmadillo to price European Put Options"
+author: "Davis Vaughan"
+date: "2/27/2018"
+output: html_document
+---
+
+## Introduction
+
+In the quest for ever faster code, one generally begins exploring ways to integrate
+C++ with R using `Rcpp`. This post provides an example of multiple implementations
+of a European Put Option pricer. The implementations are done in pure R, pure 
+`Rcpp` using some `Rcpp` sugar functions, and then in `Rcpp` using `RcppArmadillo`,
+which exposes the incredibly powerful linear algebra library, 
+[`Armadillo`](http://arma.sourceforge.net/).
+
+The value of a European Put Option has the closed form solution:
+
+$$ V = K e^{-rt} N(-d_2) - S e^{-yt} N(-d_1) $$
+
+Where:
+
+$$ 
+\begin{equation}
+  \begin{aligned}
+V    &= \text{Value of the option} \\
+r    &= \text{Risk free rate} \\
+y    &= \text{Dividend yield} \\
+t    &= \text{Time to expiry} \\
+S    &= \text{Current stock price} \\
+K    &= \text{Strike price} \\
+N(.) &= \text{Normal CDF}
+  \end{aligned}
+\end{equation}
+$$
+And:
+
+$$ 
+\begin{equation}
+  \begin{aligned}
+d_1    &= \frac{log(\frac{S}{K}) + (r - y + \frac{1}{2} \sigma^2)t}{\sigma \sqrt{t}}  \\
+d_2    &= d_1 - \sigma \sqrt{t}\\
+  \end{aligned}
+\end{equation}
+$$
+
+Armed with the formulas, we can create the pricer using just R.
+
+```{r}
+put_option_pricer <- function(s, k, r, y, t, sigma) {
+
+  d1 <- (log(s / k) + (r - y + sigma^2 / 2) * t) / (sigma * sqrt(t))
+  d2 <- d1 - sigma * sqrt(t)
+
+  V <- pnorm(-d2) * k * exp(-r * t) - s * exp(-y * t) * pnorm(-d1)
+
+  V
+}
+
+# Valuation with 1 stock price
+put_option_pricer(s = 55, 60, .01, .02, 1, .05)
+
+# Valuation across multiple prices
+put_option_pricer(s = 55:60, 60, .01, .02, 1, .05)
+```
+
+Let's see what we can do with `Rcpp`. Besides explicitely stating the types of the
+variables, not much has to change. We can even use the sugar function, `Rcpp::pnorm()`,
+to keep the syntax as close to R as possible. We don't have to use `Rcpp::` here to 
+qualify our `log()` and `pnorm()` calls, but I find it to be good practice.
+
+```{r}
+library(Rcpp)
+
+cppFunction('
+  NumericVector put_option_pricer_rcpp(NumericVector s, double k, double r, double y, double t, double sigma) {
+
+    NumericVector d1 = (Rcpp::log(s / k) + (r - y + sigma * sigma / 2.0) * t) / (sigma * sqrt(t));
+    NumericVector d2 = d1 - sigma * sqrt(t);
+    
+    NumericVector V = Rcpp::pnorm(-d2) * k * exp(-r * t) - s * exp(-y * t) * Rcpp::pnorm(-d1);
+    return V;
+}')
+
+# Valuation with 1 stock price
+put_option_pricer_rcpp(s = 55, 60, .01, .02, 1, .05)
+
+# Valuation across multiple prices
+put_option_pricer_rcpp(s = 55:60, 60, .01, .02, 1, .05)
+```
+
+Finally, let's look at `RcppArmadillo`. Armadillo has a number of object types,
+including `mat`, `colvec`, and `rowvec`. Here, we just use `colvec` to represent
+a column vector of prices. By default in Armadillo, `*` represents matrix multiplication, and
+`%` is used for element wise multiplication. We need to make this change to 
+element wise multiplication in 1 place, but otherwise the changes are just
+switching out the types and the sugar functions for Armadillo specific functions.
+
+Note that the `arma::normcdf()` function is in the development version of `RcppArmadillo`,
+which is `0.8.400.0.0` at the time of writing and additionally requires `C++11` as a plugin.
+
+```{r}
+library(RcppArmadillo)
+
+cppFunction('
+  arma::colvec put_option_pricer_arma(arma::colvec s, double k, double r, double y, double t, double sigma) {
+  
+    arma::colvec d1 = (arma::log(s / k) + (r - y + sigma * sigma / 2.0) * t) / (sigma * sqrt(t));
+    arma::colvec d2 = d1 - sigma * sqrt(t);
+    
+    // Notice the use of % to represent element wise multiplication
+    arma::colvec V = arma::normcdf(-d2) * k * exp(-r * t) - s * exp(-y * t) % arma::normcdf(-d1); 
+
+    return V;
+  }', 
+  depends = "RcppArmadillo",
+  plugins = "cpp11")
+
+# Valuation with 1 stock price
+put_option_pricer_arma(s = 55, 60, .01, .02, 1, .05)
+
+# Valuation across multiple prices
+put_option_pricer_arma(s = 55:60, 60, .01, .02, 1, .05)
+```
+
+Finally, we can run a speed test to see which comes out on top.
+
+```{r}
+s <- matrix(seq(0, 100, by = .0001), ncol = 1)
+
+rbenchmark::benchmark(
+  put_option_pricer(s, 60, .01, .02, 1, .05),
+  put_option_pricer_arma(s, 60, .01, .02, 1, .05),
+  put_option_pricer_rcpp(s, 60, .01, .02, 1, .05), 
+  order = "relative", 
+  replications = 100
+)[,1:4]
+```
+
+Interestingly, `Rcpp` comes out on top with both C++ implementations being faster than pure R,
+but this isn't the most computationally intensive problem so the differences
+aren't too extreme. The nicest thing about all of this is that it shows off the 
+"embarassment of riches" that we have in the R and C++ ecosystem for multiple ways
+of solving the same problem.
